@@ -15,6 +15,7 @@ pub enum CampaignStatus {
     Funded,
     Claimed,
     Expired,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,6 +24,13 @@ pub struct CreatedEvent {
     pub id: u64,
     pub creator: Address,
     pub target_amount: i128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct CancelledEvent {
+    pub id: u64,
+    pub creator: Address,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -299,9 +307,9 @@ fn exit_lock(env: &Env) {
 }
 
 fn derive_status(now: u64, campaign: &Campaign) -> CampaignStatus {
-    // Claimed is terminal and must not be downgraded by timestamp checks.
-    if campaign.status == CampaignStatus::Claimed {
-        return CampaignStatus::Claimed;
+    // Terminal statuses must not be downgraded by timestamp checks.
+    if campaign.status == CampaignStatus::Claimed || campaign.status == CampaignStatus::Cancelled {
+        return campaign.status.clone();
     }
 
     if campaign.raised_amount >= campaign.target_amount {
@@ -595,6 +603,29 @@ impl StellarGiveContract {
         result
     }
 
+    /// Cancels a campaign before fundraising begins.
+    pub fn cancel_campaign(env: Env, id: u64) -> Result<(), ContractError> {
+        let mut campaign = read_campaign(&env, id)?;
+        campaign.creator.require_auth();
+
+        if campaign.raised_amount > 0 {
+            return Err(ContractError::CampaignNotActive);
+        }
+
+        campaign.status = CampaignStatus::Cancelled;
+        write_campaign(&env, &campaign);
+
+        env.events().publish(
+            (symbol_short!("cancel"),),
+            CancelledEvent {
+                id,
+                creator: campaign.creator,
+            },
+        );
+
+        Ok(())
+    }
+
     /// Claims raised funds for a campaign and distributes them to beneficiaries.
     ///
     /// Net proceeds (after 1% platform fee) are split proportionally among
@@ -748,9 +779,14 @@ impl StellarGiveContract {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events as _, Ledger};
-    use soroban_sdk::{token, Address, Env, String, Symbol, TryFromVal, Vec};
+    use soroban_sdk::testutils::{
+        Address as _, AuthorizedFunction, AuthorizedInvocation, Events as _, Ledger, MockAuth,
+        MockAuthInvoke,
+    };
+    use soroban_sdk::{token, Address, Env, IntoVal, String, Symbol, TryFromVal, Vec};
 
     fn set_timestamp(env: &Env, timestamp: u64) {
         let mut ledger = env.ledger().get();
@@ -788,6 +824,51 @@ mod tests {
         let contract_id = env.register_contract(None, StellarGiveContract);
         let client = StellarGiveContractClient::new(&env, &contract_id);
         client.initialize(&platform_admin);
+
+        (
+            env,
+            client,
+            creator,
+            beneficiary,
+            donor,
+            platform_admin,
+            token_client,
+            token_admin_client,
+        )
+    }
+
+    fn setup_without_auth_mock() -> (
+        Env,
+        StellarGiveContractClient<'static>,
+        Address,
+        Address,
+        Address,
+        Address,
+        token::Client<'static>,
+        token::StellarAssetClient<'static>,
+    ) {
+        let env = Env::default();
+
+        let creator = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let donor = Address::generate(&env);
+        let platform_admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_client = token::Client::new(&env, &token_id.address());
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_id.address());
+
+        token_admin_client
+            .mock_all_auths()
+            .mint(&donor, &1_000_000_000_000);
+        token_admin_client
+            .mock_all_auths()
+            .mint(&creator, &1_000_000_000_000);
+
+        let contract_id = env.register_contract(None, StellarGiveContract);
+        let client = StellarGiveContractClient::new(&env, &contract_id);
+        client.mock_all_auths().initialize(&platform_admin);
 
         (
             env,
@@ -922,6 +1003,129 @@ mod tests {
             &None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancel_campaign_requires_creator_auth_and_emits_event() {
+        let (env, client, creator, beneficiary, _donor, _admin, token_client, _) =
+            setup_without_auth_mock();
+        set_timestamp(&env, 1_000);
+
+        let bens = single_ben(&env, &beneficiary);
+        let campaign_id = client.mock_all_auths().create_campaign(
+            &creator,
+            &bens,
+            &String::from_str(&env, "Cancelable Relief"),
+            &String::from_str(&env, "https://example.com/meta"),
+            &10_000_000,
+            &2_000,
+            &token_client.address,
+            &None,
+            &None,
+            &None,
+        );
+
+        client.mock_all_auths().cancel_campaign(&campaign_id);
+
+        assert_eq!(
+            env.auths(),
+            std::vec![(
+                creator.clone(),
+                AuthorizedInvocation {
+                    function: AuthorizedFunction::Contract((
+                        client.address.clone(),
+                        Symbol::new(&env, "cancel_campaign"),
+                        (campaign_id,).into_val(&env)
+                    )),
+                    sub_invocations: std::vec![]
+                }
+            )]
+        );
+
+        let campaign = client.get_campaign(&campaign_id);
+        assert_eq!(campaign.status, CampaignStatus::Cancelled);
+
+        let event = env
+            .events()
+            .all()
+            .iter()
+            .find(|(addr, topics, _)| {
+                addr == &client.address
+                    && topics
+                        .get(0)
+                        .and_then(|t| Symbol::try_from_val(&env, &t).ok())
+                        == Some(symbol_short!("cancel"))
+            })
+            .expect("CancelledEvent was not emitted by cancel_campaign");
+
+        let payload = CancelledEvent::try_from_val(&env, &event.2)
+            .expect("event data did not decode as CancelledEvent");
+        assert_eq!(payload.id, campaign_id);
+        assert_eq!(payload.creator, creator);
+    }
+
+    #[test]
+    fn cancel_campaign_rejects_non_creator_auth() {
+        let (env, client, creator, beneficiary, _donor, _admin, token_client, _) =
+            setup_without_auth_mock();
+        set_timestamp(&env, 1_000);
+
+        let bens = single_ben(&env, &beneficiary);
+        let campaign_id = client.mock_all_auths().create_campaign(
+            &creator,
+            &bens,
+            &String::from_str(&env, "Creator Only"),
+            &String::from_str(&env, "https://example.com/meta"),
+            &10_000_000,
+            &2_000,
+            &token_client.address,
+            &None,
+            &None,
+            &None,
+        );
+
+        let attacker = Address::generate(&env);
+        let invoke = MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "cancel_campaign",
+            args: (campaign_id,).into_val(&env),
+            sub_invokes: &[],
+        };
+        let auths = [MockAuth {
+            address: &attacker,
+            invoke: &invoke,
+        }];
+
+        let result = client.mock_auths(&auths).try_cancel_campaign(&campaign_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancel_campaign_blocks_when_raised_amount_is_positive() {
+        let (env, client, creator, beneficiary, donor, _admin, token_client, _) = setup();
+        set_timestamp(&env, 1_000);
+
+        let bens = single_ben(&env, &beneficiary);
+        let campaign_id = client.create_campaign(
+            &creator,
+            &bens,
+            &String::from_str(&env, "Already Fundraising"),
+            &String::from_str(&env, "https://example.com/meta"),
+            &10_000_000,
+            &2_000,
+            &token_client.address,
+            &None,
+            &None,
+            &None,
+        );
+        client.donate(&donor, &campaign_id, &MIN_DONATION, &false);
+
+        let result = client.try_cancel_campaign(&campaign_id);
+        assert_eq!(result, Err(Ok(ContractError::CampaignNotActive)));
+        assert_eq!(
+            client.get_campaign(&campaign_id).status,
+            CampaignStatus::Active
+        );
     }
 
     // -----------------------------------------------------------------------

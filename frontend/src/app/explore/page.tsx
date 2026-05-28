@@ -62,6 +62,19 @@ export default function ExplorePage() {
     );
   }, [campaigns, debouncedSearch, statusFilter]);
 
+  const emptyMessage = useMemo(() => {
+    if (debouncedSearch) {
+      return "No campaigns match your search.";
+    }
+    if (statusFilter === "funded") {
+      return "No funded campaigns yet.";
+    }
+    if (statusFilter === "active") {
+      return "No active campaigns right now.";
+    }
+    return "No campaigns found. Be the first to create one!";
+  }, [debouncedSearch, statusFilter]);
+
   return (
     <div className="flex flex-col min-h-screen">
       <Navbar />
@@ -130,11 +143,7 @@ export default function ExplorePage() {
             ))}
           </div>
         ) : filtered.length === 0 ? (
-          <div className="text-center py-20 text-muted-foreground">
-            {debouncedSearch
-              ? "No campaigns match your search."
-              : "No campaigns found. Be the first to create one!"}
-          </div>
+          <div className="text-center py-20 text-muted-foreground">{emptyMessage}</div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {filtered.map((campaign) => (

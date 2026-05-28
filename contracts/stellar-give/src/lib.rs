@@ -122,17 +122,38 @@ fn campaign_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("CMP"), id)
 }
 
-fn read_next_id(env: &Env) -> u64 {
-    // Instance storage is cheaper per access than Persistent and its lifetime
-    // is managed with the contract instance, so no manual TTL extension needed.
+const INSTANCE_BUMP_AMOUNT: u32 = 518400; // ~30 days
+const INSTANCE_LIFETIME_THRESHOLD: u32 = 17280; // ~1 day
+
+fn extend_instance_ttl(env: &Env) {
     env.storage()
         .instance()
-        .get(&next_id_key())
-        .unwrap_or(1_u64)
+        .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+}
+
+fn read_next_id(env: &Env) -> u64 {
+    let key = next_id_key();
+
+    if let Some(id) = env.storage().instance().get(&key) {
+        extend_instance_ttl(env);
+        return id;
+    }
+
+    // Phase 5: Migration logic from persistent to instance storage
+    if let Some(id) = env.storage().persistent().get(&key) {
+        env.storage().instance().set(&key, &id);
+        env.storage().persistent().remove(&key);
+        extend_instance_ttl(env);
+        return id;
+    }
+
+    extend_instance_ttl(env);
+    1_u64
 }
 
 fn write_next_id(env: &Env, next_id: u64) {
     env.storage().instance().set(&next_id_key(), &next_id);
+    extend_instance_ttl(env);
 }
 
 fn read_campaign(env: &Env, id: u64) -> Result<Campaign, ContractError> {
@@ -262,6 +283,7 @@ fn sync_status(env: &Env, campaign: &mut Campaign) {
 /// by calling two lightweight read methods. Returns `InvalidToken` if either
 /// call fails, preventing campaigns from being created with non-compliant or
 /// malicious token contracts.
+#[allow(clippy::manual_range_contains)]
 fn validate_url(url: &String) -> Result<(), ContractError> {
     let len = url.len() as usize;
     if len < 8 || len > 200 {
@@ -313,6 +335,7 @@ impl StellarGiveContract {
     ///
     /// # Errors
     /// * `InvalidToken` if `accepted_token` does not implement `decimals()` and `symbol()`.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_campaign(
         env: Env,
         creator: Address,
@@ -815,6 +838,8 @@ mod tests {
             &2_000,
             &token_client.address,
             &None,
+            &None,
+            &None,
         );
         assert!(result.is_ok(), "valid SAC token must be accepted");
     }
@@ -835,6 +860,8 @@ mod tests {
             &10_000_000,
             &2_000,
             &not_a_token,
+            &None,
+            &None,
             &None,
         );
         assert!(
@@ -1151,6 +1178,8 @@ mod tests {
                 &2_000,
                 &token_client.address,
                 &None,
+                &None,
+                &None,
             );
             assert_eq!(id, expected_id);
         }
@@ -1278,6 +1307,8 @@ mod tests {
             &20_000,
             &token_client.address,
             &None,
+            &None,
+            &None,
         );
         client.donate(&donor, &campaign_id, &gross, &false);
 
@@ -1366,6 +1397,8 @@ mod tests {
             &2_000,
             &token_client.address,
             &None,
+            &None,
+            &None,
         );
         assert_eq!(result, Err(Ok(ContractError::TargetTooLow)));
     }
@@ -1387,6 +1420,8 @@ mod tests {
             &2_000,
             &token_client.address,
             &None,
+            &None,
+            &None,
         );
         assert_eq!(result, Err(Ok(ContractError::InvalidMetadataUri)));
 
@@ -1402,6 +1437,8 @@ mod tests {
             &MIN_TARGET,
             &2_000,
             &token_client.address,
+            &None,
+            &None,
             &None,
         );
         assert_eq!(result, Err(Ok(ContractError::MetadataUriTooLong)));
@@ -1425,6 +1462,8 @@ mod tests {
             &2_000,
             &token_client.address,
             &Some(cap),
+            &None,
+            &None,
         );
 
         // First donation within cap
@@ -1452,6 +1491,8 @@ mod tests {
             &10_000_000,
             &10_000,
             &token_client.address,
+            &None,
+            &None,
             &None,
         );
 
@@ -1521,6 +1562,8 @@ mod tests {
             &10_000,
             &token_client.address,
             &None,
+            &None,
+            &None,
         );
 
         client.donate(&donor, &campaign_id, &1_000_000, &false);
@@ -1549,5 +1592,96 @@ mod tests {
         let top = client.get_top_donors(&campaign_id);
         assert_eq!(top.len(), 1);
         assert_eq!(top.get(0).unwrap().0, donor);
+    }
+
+    #[test]
+    fn test_next_id_migration_and_instance_storage() {
+        let (env, client, creator, beneficiary, _donor, _admin, token_client, _) = setup();
+        
+        env.as_contract(&client.address, || {
+            let key = next_id_key();
+            
+            // Ensure starting state is 1
+            assert_eq!(read_next_id(&env), 1);
+            
+            // Simulate old deployment by setting NEXT_ID in persistent storage manually
+            let old_id: u64 = 42;
+            env.storage().persistent().set(&key, &old_id);
+            
+            // Ensure it's not in instance storage yet
+            assert!(env.storage().instance().get::<_, u64>(&key).is_none());
+            
+            // 1. Next read should migrate from persistent to instance
+            let read_id = read_next_id(&env);
+            assert_eq!(read_id, old_id);
+            
+            // 2. Verify it was removed from persistent
+            assert!(env.storage().persistent().get::<_, u64>(&key).is_none());
+            
+            // 3. Verify it was written to instance
+            let instance_id = env.storage().instance().get::<_, u64>(&key).unwrap();
+            assert_eq!(instance_id, old_id);
+        });
+        
+        // Create a campaign, should use the migrated ID 42 and increment to 43
+        let bens = single_ben(&env, &beneficiary);
+        let campaign_id = client.create_campaign(
+            &creator,
+            &bens,
+            &String::from_str(&env, "Migrated Campaign"),
+            &String::from_str(&env, "https://example.com/meta"),
+            &10_000_000,
+            &10_000,
+            &token_client.address,
+            &None,
+            &None,
+            &None,
+        );
+        
+        assert_eq!(campaign_id, 42);
+        
+        // Check next id is 43 in instance storage
+        env.as_contract(&client.address, || {
+            let key = next_id_key();
+            assert_eq!(read_next_id(&env), 43);
+            assert_eq!(env.storage().instance().get::<_, u64>(&key).unwrap(), 43);
+        });
+    }
+
+    #[test]
+    fn test_sequential_id_behavior() {
+        let (env, client, creator, beneficiary, _donor, _admin, token_client, _) = setup();
+
+        let bens = single_ben(&env, &beneficiary);
+        let id1 = client.create_campaign(
+            &creator,
+            &bens,
+            &String::from_str(&env, "Camp 1"),
+            &String::from_str(&env, "https://example.com/meta"),
+            &10_000_000,
+            &10_000,
+            &token_client.address,
+            &None,
+            &None,
+            &None,
+        );
+        let id2 = client.create_campaign(
+            &creator,
+            &bens,
+            &String::from_str(&env, "Camp 2"),
+            &String::from_str(&env, "https://example.com/meta"),
+            &10_000_000,
+            &10_000,
+            &token_client.address,
+            &None,
+            &None,
+            &None,
+        );
+
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        env.as_contract(&client.address, || {
+            assert_eq!(read_next_id(&env), 3);
+        });
     }
 }

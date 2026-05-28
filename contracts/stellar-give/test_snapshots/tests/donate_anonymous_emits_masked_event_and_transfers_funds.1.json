@@ -136,6 +136,8 @@
                 {
                   "address": "CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN"
                 },
+                "void",
+                "void",
                 "void"
               ]
             }
@@ -614,6 +616,18 @@
                       "val": {
                         "string": "Medical Aid"
                       }
+                    },
+                    {
+                      "key": {
+                        "symbol": "twitter"
+                      },
+                      "val": "void"
+                    },
+                    {
+                      "key": {
+                        "symbol": "website"
+                      },
+                      "val": "void"
                     }
                   ]
                 }
@@ -775,7 +789,7 @@
             },
             "ext": "v0"
           },
-          4095
+          518400
         ]
       ],
       [
@@ -1127,7 +1141,7 @@
             },
             "ext": "v0"
           },
-          4095
+          518400
         ]
       ]
     ]
@@ -1533,6 +1547,8 @@
                 {
                   "address": "CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN"
                 },
+                "void",
+                "void",
                 "void"
               ]
             }
@@ -2159,6 +2175,18 @@
                   "val": {
                     "string": "Medical Aid"
                   }
+                },
+                {
+                  "key": {
+                    "symbol": "twitter"
+                  },
+                  "val": "void"
+                },
+                {
+                  "key": {
+                    "symbol": "website"
+                  },
+                  "val": "void"
                 }
               ]
             }

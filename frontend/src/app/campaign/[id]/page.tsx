@@ -4,6 +4,7 @@ import { useCampaign } from "@/hooks/useSoroban";
 import { ShareButton } from "@/components/ShareButton";
 import { Skeleton } from "@/components/ui/skeleton";
 import { RecentDonations } from "@/components/RecentDonations";
+import { AddressLink } from "@/components/AddressLink";
 
 export default function CampaignDetails({ params }: { params: { id: string } }) {
   const { data: campaign, isLoading } = useCampaign(BigInt(params.id));
@@ -20,7 +21,15 @@ export default function CampaignDetails({ params }: { params: { id: string } }) 
             )}
           </h1>
           {!isLoading && campaign && (
-            <div className="flex gap-4 text-sm text-muted-foreground pt-1">
+            <div className="flex flex-wrap gap-4 text-sm text-muted-foreground pt-1">
+              <span className="inline-flex items-center gap-2">
+                Creator:
+                <AddressLink address={campaign.creator} className="text-xs" />
+              </span>
+              <span className="inline-flex items-center gap-2">
+                Beneficiary:
+                <AddressLink address={campaign.beneficiary} className="text-xs" />
+              </span>
               {campaign.website && (
                 <a href={campaign.website} target="_blank" rel="noopener noreferrer" className="hover:text-primary transition-colors flex items-center gap-1 font-medium">
                   🌐 Website
@@ -33,7 +42,7 @@ export default function CampaignDetails({ params }: { params: { id: string } }) 
               )}
             </div>
           )}
-        </h1>
+        </div>
         {campaign && <ShareButton campaign={campaign} />}
       </div>
       

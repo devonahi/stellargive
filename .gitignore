@@ -38,6 +38,9 @@ build/
 coverage/
 *.tsbuildinfo
 storybook-static/
+playwright-report/
+test-results/
+playwright/.cache/
 
 # ---------------------------
 # Logs

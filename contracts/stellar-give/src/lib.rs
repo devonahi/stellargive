@@ -61,6 +61,14 @@ pub struct AutoClaimedEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
+pub struct ClaimedEvent {
+    pub campaign_id: u64,
+    pub amount: i128,
+    pub beneficiary: Address,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct Campaign {
     pub id: u64,
     pub creator: Address,
@@ -783,7 +791,7 @@ impl StellarGiveContract {
                 // Emit AutoClaimed event for the first beneficiary
                 let (first_beneficiary, _) = campaign.beneficiaries.get(0).unwrap();
                 env.events().publish(
-                    (symbol_short!("autoclaimed"),),
+                    (Symbol::new(&env, "autoclaimed"),),
                     AutoClaimedEvent {
                         campaign_id: campaign.id,
                         total_raised,
@@ -1033,7 +1041,6 @@ impl StellarGiveContract {
     ///
     /// This value is derived from the NEXT_ID storage key and reflects all campaigns
     /// created, including expired or cancelled campaigns.
-    #[readonly]
     pub fn get_total_campaigns(env: Env) -> u64 {
         let next_id = read_next_id(&env);
         next_id.saturating_sub(1)
@@ -1052,7 +1059,6 @@ impl StellarGiveContract {
     ///
     /// Returns 0 if the deadline has passed, otherwise returns the number of seconds
     /// until the deadline. This is a read-only function that requires no authentication.
-    #[readonly]
     pub fn get_time_left(env: Env, campaign_id: u64) -> Result<u64, ContractError> {
         let campaign = read_campaign(&env, campaign_id)?;
         let now = env.ledger().timestamp();
@@ -1075,7 +1081,7 @@ impl StellarGiveContract {
 
         // Batch write whitelist entries
         for addr in addresses.iter() {
-            write_whitelist(&env, id, addr, true);
+            write_whitelist(&env, id, &addr, true);
         }
 
         Ok(())
@@ -1131,7 +1137,7 @@ mod tests {
         Address as _, AuthorizedFunction, AuthorizedInvocation, Events as _, Ledger, MockAuth,
         MockAuthInvoke,
     };
-    use soroban_sdk::{token, Address, Env, IntoVal, String, Symbol, TryFromVal, Vec};
+    use soroban_sdk::{token, Address, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Vec};
 
     fn set_timestamp(env: &Env, timestamp: u64) {
         let mut ledger = env.ledger().get();
@@ -3872,7 +3878,7 @@ mod tests {
             let events = env.events().all();
             let claimed_event_exists = events
                 .iter()
-                .any(|event| event.topics.get(0).unwrap() == symbol_short!("claimed").into());
+                .any(|event| event.1.get(0).unwrap() == symbol_short!("claimed").into());
             assert!(
                 claimed_event_exists,
                 "Audit event Claimed must be published"
@@ -4048,7 +4054,7 @@ mod tests {
                         && topics
                             .get(0)
                             .and_then(|t| Symbol::try_from_val(&env, &t).ok())
-                            == Some(symbol_short!("autoclaimed"))
+                            == Some(Symbol::new(&env, "autoclaimed"))
                 })
                 .expect("AutoClaimedEvent was not emitted");
 
@@ -4213,7 +4219,7 @@ mod tests {
             // Move time past deadline
             set_timestamp(&env, 3_000);
 
-            let time_left = client.get_time_left(&campaign_id).unwrap();
+            let time_left = client.get_time_left(&campaign_id);
             assert_eq!(time_left, 0);
         }
 
@@ -4236,7 +4242,7 @@ mod tests {
                 &None,
             );
 
-            let time_left = client.get_time_left(&campaign_id).unwrap();
+            let time_left = client.get_time_left(&campaign_id);
             assert_eq!(time_left, 4_000); // 5000 - 1000
         }
 
@@ -4262,7 +4268,7 @@ mod tests {
             // Move to exact deadline
             set_timestamp(&env, 5_000);
 
-            let time_left = client.get_time_left(&campaign_id).unwrap();
+            let time_left = client.get_time_left(&campaign_id);
             assert_eq!(time_left, 0);
         }
 
@@ -4301,22 +4307,22 @@ mod tests {
             );
 
             // Check time at start
-            let time_left_1 = client.get_time_left(&campaign_id).unwrap();
+            let time_left_1 = client.get_time_left(&campaign_id);
             assert_eq!(time_left_1, 9_000);
 
             // Move forward
             set_timestamp(&env, 5_000);
-            let time_left_2 = client.get_time_left(&campaign_id).unwrap();
+            let time_left_2 = client.get_time_left(&campaign_id);
             assert_eq!(time_left_2, 5_000);
 
             // Move closer
             set_timestamp(&env, 9_000);
-            let time_left_3 = client.get_time_left(&campaign_id).unwrap();
+            let time_left_3 = client.get_time_left(&campaign_id);
             assert_eq!(time_left_3, 1_000);
 
             // Pass deadline
             set_timestamp(&env, 15_000);
-            let time_left_4 = client.get_time_left(&campaign_id).unwrap();
+            let time_left_4 = client.get_time_left(&campaign_id);
             assert_eq!(time_left_4, 0);
         }
 
@@ -4405,9 +4411,375 @@ mod tests {
                 &None,
             );
 
-            client.cancel_campaign(&creator, &campaign_id_2);
+            client.cancel_campaign(&campaign_id_2);
 
             assert_eq!(client.get_total_campaigns(), 3);
+        }
+    }
+
+    // =======================================================================
+    // Admin authorization tests
+    // Verifies that upgrade, set_owner, and get_owner enforce correct access
+    // control, and that ownership transfers correctly revoke old-owner rights.
+    // =======================================================================
+
+    mod admin_auth_tests {
+        use super::*;
+
+        // -------------------------------------------------------------------
+        // Helpers
+        // -------------------------------------------------------------------
+
+        /// Build a MockAuth for a single contract function call.
+        macro_rules! mock_auth {
+            ($addr:expr, $client:expr, $fn:expr, $args:expr) => {
+                MockAuth {
+                    address: $addr,
+                    invoke: &MockAuthInvoke {
+                        contract: &$client.address,
+                        fn_name: $fn,
+                        args: $args,
+                        sub_invokes: &[],
+                    },
+                }
+            };
+        }
+
+        fn zero_hash(env: &Env) -> BytesN<32> {
+            BytesN::<32>::from_array(env, &[0u8; 32])
+        }
+
+        // -------------------------------------------------------------------
+        // get_owner
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn get_owner_returns_admin_set_by_initialize() {
+            let (_, client, _, _, _, admin, _, _) = setup();
+            assert_eq!(client.get_owner(), admin);
+        }
+
+        #[test]
+        fn get_owner_fails_before_initialize() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let id = env.register_contract(None, StellarGiveContract);
+            let client = StellarGiveContractClient::new(&env, &id);
+            assert_eq!(
+                client.try_get_owner(),
+                Err(Ok(ContractError::NotInitialized))
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // upgrade — NotInitialized guard
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn upgrade_returns_not_initialized_before_initialize() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let id = env.register_contract(None, StellarGiveContract);
+            let client = StellarGiveContractClient::new(&env, &id);
+            let result = client.try_upgrade(&zero_hash(&env));
+            assert_eq!(
+                result,
+                Err(Ok(ContractError::NotInitialized)),
+                "upgrade must return NotInitialized when contract is not yet initialized"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // upgrade — unauthorized caller is rejected
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn upgrade_rejects_non_owner_caller() {
+            let (env, client, _, _, _, _, _, _) = setup_without_auth_mock();
+            let attacker = Address::generate(&env);
+            let dummy = zero_hash(&env);
+            let result = client
+                .mock_auths(&[mock_auth!(
+                    &attacker,
+                    client,
+                    "upgrade",
+                    (dummy.clone(),).into_val(&env)
+                )])
+                .try_upgrade(&dummy);
+            assert!(
+                result.is_err(),
+                "upgrade must reject a caller that is not the owner"
+            );
+        }
+
+        #[test]
+        fn upgrade_rejects_random_third_party() {
+            let (env, client, _, _, _, _, _, _) = setup_without_auth_mock();
+            // Use several distinct addresses to confirm no hardcoded bypass
+            for _ in 0..3 {
+                let stranger = Address::generate(&env);
+                let dummy = zero_hash(&env);
+                let result = client
+                    .mock_auths(&[mock_auth!(
+                        &stranger,
+                        client,
+                        "upgrade",
+                        (dummy.clone(),).into_val(&env)
+                    )])
+                    .try_upgrade(&dummy);
+                assert!(result.is_err(), "stranger must be rejected by upgrade");
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // -------------------------------------------------------------------
+        // set_owner — NotInitialized guard
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn set_owner_returns_not_initialized_before_initialize() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let id = env.register_contract(None, StellarGiveContract);
+            let client = StellarGiveContractClient::new(&env, &id);
+            let result = client.try_set_owner(&Address::generate(&env));
+            assert_eq!(
+                result,
+                Err(Ok(ContractError::NotInitialized)),
+                "set_owner must return NotInitialized when contract is not yet initialized"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // set_owner — unauthorized caller is rejected
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn set_owner_rejects_non_owner_caller() {
+            let (env, client, _, _, _, _, _, _) = setup_without_auth_mock();
+            let attacker = Address::generate(&env);
+            let new_owner = Address::generate(&env);
+            let result = client
+                .mock_auths(&[mock_auth!(
+                    &attacker,
+                    client,
+                    "set_owner",
+                    (new_owner.clone(),).into_val(&env)
+                )])
+                .try_set_owner(&new_owner);
+            assert!(
+                result.is_err(),
+                "set_owner must reject a caller that is not the current owner"
+            );
+        }
+
+        #[test]
+        fn set_owner_rejects_beneficiary_acting_as_owner() {
+            let (env, client, _, beneficiary, _, _, _, _) = setup_without_auth_mock();
+            let new_owner = Address::generate(&env);
+            let result = client
+                .mock_auths(&[mock_auth!(
+                    &beneficiary,
+                    client,
+                    "set_owner",
+                    (new_owner.clone(),).into_val(&env)
+                )])
+                .try_set_owner(&new_owner);
+            assert!(result.is_err(), "beneficiary address must not bypass set_owner auth");
+        }
+
+        // -------------------------------------------------------------------
+        // set_owner — authorized owner succeeds
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn set_owner_accepts_current_owner_and_persists_new_address() {
+            let (env, client, _, _, _, admin, _, _) = setup_without_auth_mock();
+            let new_owner = Address::generate(&env);
+            client
+                .mock_auths(&[mock_auth!(
+                    &admin,
+                    client,
+                    "set_owner",
+                    (new_owner.clone(),).into_val(&env)
+                )])
+                .set_owner(&new_owner);
+            assert_eq!(
+                client.get_owner(),
+                new_owner,
+                "get_owner must return the address passed to set_owner"
+            );
+        }
+
+        #[test]
+        fn set_owner_emits_owner_set_event() {
+            let (env, client, _, _, _, admin, _, _) = setup_without_auth_mock();
+            let new_owner = Address::generate(&env);
+            client
+                .mock_auths(&[mock_auth!(
+                    &admin,
+                    client,
+                    "set_owner",
+                    (new_owner.clone(),).into_val(&env)
+                )])
+                .set_owner(&new_owner);
+            let found = env.events().all().iter().any(|(addr, topics, _)| {
+                addr == &client.address
+                    && topics
+                        .get(0)
+                        .and_then(|t| Symbol::try_from_val(&env, &t).ok())
+                        == Some(symbol_short!("OwnerSet"))
+            });
+            assert!(found, "set_owner must emit an OwnerSet event");
+        }
+
+        // -------------------------------------------------------------------
+        // Ownership transfer edge cases
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn old_owner_rejected_by_set_owner_after_transfer() {
+            let (env, client, _, _, _, admin, _, _) = setup_without_auth_mock();
+            let new_owner = Address::generate(&env);
+
+            // Transfer ownership admin → new_owner
+            client
+                .mock_auths(&[mock_auth!(
+                    &admin,
+                    client,
+                    "set_owner",
+                    (new_owner.clone(),).into_val(&env)
+                )])
+                .set_owner(&new_owner);
+
+            // Old admin tries to transfer ownership again → must fail
+            let another = Address::generate(&env);
+            let result = client
+                .mock_auths(&[mock_auth!(
+                    &admin,
+                    client,
+                    "set_owner",
+                    (another.clone(),).into_val(&env)
+                )])
+                .try_set_owner(&another);
+            assert!(
+                result.is_err(),
+                "old owner must be rejected by set_owner after ownership has been transferred"
+            );
+        }
+
+        #[test]
+        fn new_owner_accepted_by_set_owner_after_transfer() {
+            let (env, client, _, _, _, admin, _, _) = setup_without_auth_mock();
+            let new_owner = Address::generate(&env);
+
+            // Transfer ownership admin → new_owner
+            client
+                .mock_auths(&[mock_auth!(
+                    &admin,
+                    client,
+                    "set_owner",
+                    (new_owner.clone(),).into_val(&env)
+                )])
+                .set_owner(&new_owner);
+
+            // New owner transfers to a third address → must succeed
+            let third_owner = Address::generate(&env);
+            client
+                .mock_auths(&[mock_auth!(
+                    &new_owner,
+                    client,
+                    "set_owner",
+                    (third_owner.clone(),).into_val(&env)
+                )])
+                .set_owner(&third_owner);
+            assert_eq!(
+                client.get_owner(),
+                third_owner,
+                "new owner must be able to exercise set_owner after transfer"
+            );
+        }
+
+        #[test]
+        fn old_owner_rejected_by_upgrade_after_transfer() {
+            let (env, client, _, _, _, admin, _, _) = setup_without_auth_mock();
+            let new_owner = Address::generate(&env);
+
+            // Transfer ownership admin → new_owner
+            client
+                .mock_auths(&[mock_auth!(
+                    &admin,
+                    client,
+                    "set_owner",
+                    (new_owner.clone(),).into_val(&env)
+                )])
+                .set_owner(&new_owner);
+
+            // Old admin now tries to call upgrade → must fail
+            let dummy = zero_hash(&env);
+            let result = client
+                .mock_auths(&[mock_auth!(
+                    &admin,
+                    client,
+                    "upgrade",
+                    (dummy.clone(),).into_val(&env)
+                )])
+                .try_upgrade(&dummy);
+            assert!(
+                result.is_err(),
+                "old owner must be rejected by upgrade after ownership has been transferred"
+            );
+        }
+
+        #[test]
+        fn ownership_chain_transfer_is_respected() {
+            // A → B → C: each hand-off must revoke the previous owner
+            let (env, client, _, _, _, admin, _, _) = setup_without_auth_mock();
+            let owner_b = Address::generate(&env);
+            let owner_c = Address::generate(&env);
+
+            client
+                .mock_auths(&[mock_auth!(
+                    &admin,
+                    client,
+                    "set_owner",
+                    (owner_b.clone(),).into_val(&env)
+                )])
+                .set_owner(&owner_b);
+
+            client
+                .mock_auths(&[mock_auth!(
+                    &owner_b,
+                    client,
+                    "set_owner",
+                    (owner_c.clone(),).into_val(&env)
+                )])
+                .set_owner(&owner_c);
+
+            assert_eq!(client.get_owner(), owner_c);
+
+            // Original admin (A) must now be rejected
+            let dummy = zero_hash(&env);
+            let result_a = client
+                .mock_auths(&[mock_auth!(
+                    &admin,
+                    client,
+                    "upgrade",
+                    (dummy.clone(),).into_val(&env)
+                )])
+                .try_upgrade(&dummy);
+            assert!(result_a.is_err(), "original admin must be rejected after two-hop transfer");
+
+            // Owner B must now be rejected
+            let result_b = client
+                .mock_auths(&[mock_auth!(
+                    &owner_b,
+                    client,
+                    "upgrade",
+                    (dummy.clone(),).into_val(&env)
+                )])
+                .try_upgrade(&dummy);
+            assert!(result_b.is_err(), "intermediate owner B must be rejected after transfer to C");
         }
     }
 }

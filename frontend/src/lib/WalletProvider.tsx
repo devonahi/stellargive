@@ -2,6 +2,7 @@
 
 import React, { createContext, useContext, useEffect, useState } from "react";
 import { isConnected, getAddress, setAllowed } from "@stellar/freighter-api";
+import * as Sentry from "@sentry/nextjs";
 
 interface WalletContextType {
   address: string | null;
@@ -14,6 +15,14 @@ const WalletContext = createContext<WalletContextType | undefined>(undefined);
 
 export function WalletProvider({ children }: { children: React.ReactNode }) {
   const [address, setAddress] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (address) {
+      Sentry.setUser({ id: address });
+    } else {
+      Sentry.setUser(null);
+    }
+  }, [address]);
   const [isWalletConnected, setIsWalletConnected] = useState(false);
 
   useEffect(() => {

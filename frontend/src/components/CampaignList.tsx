@@ -136,8 +136,16 @@ export function CampaignList() {
           <CampaignCard key={campaign.id.toString()} campaign={campaign} />
         ))}
         {(campaigns?.length ?? 0) === 0 && (
-          <div className="col-span-full text-center py-12 text-muted-foreground">
-            No campaigns found. Be the first to create one!
+          <div className="col-span-full flex flex-col items-center gap-4 py-12 text-center">
+            <div>
+              <p className="font-medium text-foreground">No campaigns found</p>
+              <p className="text-sm text-muted-foreground">
+                Why not create the first one?
+              </p>
+            </div>
+            <Button asChild>
+              <Link href="/create">Create campaign</Link>
+            </Button>
           </div>
         )}
         {(campaigns?.length ?? 0) > 0 && displayedCampaigns.length === 0 && (
